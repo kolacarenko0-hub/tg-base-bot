@@ -2,3 +2,4 @@ pyTelegramBotAPI
 pymupdf
 python-docx
 openai
+flask
