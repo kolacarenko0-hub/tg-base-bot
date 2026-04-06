@@ -53,19 +53,81 @@ def extract_text_from_img(path):
         return ""
 
 # --- 4. ОБРОБКА ЧЕРЕЗ AI (ФОРМАТУВАННЯ) ---
+# --- ОНОВЛЕНА ФУНКЦІЯ ФОРМАТУВАННЯ ---
 def format_content(raw_text):
     try:
         res = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": "Ти — інструмент для оцифрування документів. Твоє завдання: переписати наданий текст ОДИН В ОДИН. Якщо в тексті є таблиці — відобрази їх у форматі Markdown таблиць. Не додавай від себе жодних коментарів, висновків чи привітань. Тільки чистий текст із документа."},
-                {"role": "user", "content": raw_text[:12000]}
+                {"role": "system", "content": """Ти — професійний диджиталізатор документів. 
+                Твоє завдання: перетворити сирий текст на структуровані блоки.
+                
+                ПРАВИЛА:
+                1. Розділяй інформацію на логічні блоки за допомогою заголовків: ### НАЗВА БЛОКУ.
+                2. ТАБЛИЦІ: Використовуй суворий Markdown формат (| Column |). 
+                   Якщо таблиця складна або дуже широка — перетвори її на список форматі 'Назва поля: Значення'.
+                3. СТРУКТУРА: Дотримуйся чіткої ієрархії, щоб дані було легко зчитувати автоматизованим системам.
+                4. НІЯКИХ коментарів від себе. Тільки структуровані дані з документа.
+                5. Виправляй очевидні помилки розпізнавання символів (OCR артефакти)."""},
+                {"role": "user", "content": f"Оцифруй цей текст:\n{raw_text[:12000]}"}
             ],
             temperature=0
         )
         return res.choices[0].message.content
     except Exception as e:
-        return f"Помилка форматування: {e}"
+        return f"Помилка оцифрування: {e}"
+
+# --- ОНОВЛЕНИЙ ОБРОБНИК (ЗБЕРЕЖЕННЯ СТРУКТУРИ) ---
+@bot.message_handler(content_types=['photo', 'document'])
+def handle_files(message):
+    status = bot.reply_to(message, "⚙️ Виконую структурне оцифрування...")
+    temp_path = f"in_{message.chat.id}"
+    res_path = f"struct_{message.chat.id}.docx"
+    
+    try:
+        if message.content_type == 'photo':
+            file_info = bot.get_file(message.photo[-1].file_id)
+            temp_path += ".png"
+            with open(temp_path, "wb") as f:
+                f.write(bot.download_file(file_info.file_path))
+            # Для таблиць на фото використовуємо спеціальний режим psm 6
+            raw_text = pytesseract.image_to_string(Image.open(temp_path), lang='ukr+eng', config='--psm 6')
+        else:
+            fname = message.document.file_name.lower()
+            temp_path += f"_{fname}"
+            file_info = bot.get_file(message.document.file_id)
+            with open(temp_path, "wb") as f:
+                f.write(bot.download_file(file_info.file_path))
+            
+            if fname.endswith('.pdf'):
+                raw_text = extract_text_from_pdf(temp_path)
+            elif fname.endswith('.docx'):
+                d = docx.Document(temp_path)
+                raw_text = "\n".join([p.text for p in d.paragraphs])
+            else: return
+
+        formatted_data = format_content(raw_text)
+
+        # Створюємо документ з підтримкою структури
+        doc_out = docx.Document()
+        for line in formatted_data.split('\n'):
+            if line.startswith('###'):
+                doc_out.add_heading(line.replace('###', '').strip(), level=3)
+            else:
+                doc_out.add_paragraph(line)
+        
+        doc_out.save(res_path)
+
+        with open(res_path, "rb") as f:
+            bot.send_document(message.chat.id, f, caption="✅ Структуровані дані готові для основного бота.")
+
+    except Exception as e:
+        bot.reply_to(message, f"❌ Помилка: {e}")
+    finally:
+        for p in [temp_path, res_path]:
+            if os.path.exists(p): os.remove(p)
+        bot.delete_message(message.chat.id, status.message_id)
+        gc.collect()
 
 # --- 5. ОБРОБНИКИ ---
 
