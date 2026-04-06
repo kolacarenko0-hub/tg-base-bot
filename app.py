@@ -114,6 +114,14 @@ def run_flask():
     web_app.run(host="0.0.0.0", port=port)
 
 if __name__ == "__main__":
+    # Запускаємо Flask у окремому потоці для Render
     threading.Thread(target=run_flask, daemon=True).start()
-    bot.infinity_polling()
     
+    # Видаляємо старий веб-хук, щоб прибрати помилку 409
+    bot.remove_webhook()
+    time.sleep(1) # Невелика пауза для стабілізації
+    
+    print("Бот запущений успішно через Long Polling...")
+    
+    # Запускаємо нескінченне опитування
+    bot.infinity_polling(timeout=90, long_polling_timeout=5)
