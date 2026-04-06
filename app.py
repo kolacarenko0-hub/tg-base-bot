@@ -7,6 +7,7 @@ from openai import OpenAI
 from flask import Flask
 from PIL import Image
 import pytesseract
+import time
 import threading
 
 # --- СЕРВЕР ДЛЯ RENDER ---
