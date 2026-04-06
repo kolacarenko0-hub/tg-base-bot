@@ -2,6 +2,7 @@ import os
 import time
 import threading
 import gc
+import re
 import telebot
 import fitz
 import docx
@@ -10,91 +11,90 @@ from flask import Flask
 from PIL import Image
 import pytesseract
 
-# --- 1. СЕРВЕР ---
+# --- 1. ВЕБ-СЕРВЕР ДЛЯ RENDER (Щоб не було Port Timeout) ---
 web_app = Flask(__name__)
+
 @web_app.route('/')
-def health_check(): return "Scanner Bot Active", 200
+def health_check():
+    return "Military Scanner Bot is running!", 200
 
 def run_web():
+    # Render автоматично надає порт через змінну PORT
     port = int(os.environ.get("PORT", 10000))
+    # host="0.0.0.0" обов'язковий для зовнішнього доступу на Render
     web_app.run(host="0.0.0.0", port=port)
 
-# --- 2. КОНФІГУРАЦІЯ ---
+# --- 2. НАЛАШТУВАННЯ ---
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 AI_KEY = os.environ.get("OPENAI_API_KEY")
+
 bot = telebot.TeleBot(TOKEN)
 client = OpenAI(api_key=AI_KEY)
 
 # --- 3. ФУНКЦІЇ ЗЧИТУВАННЯ ---
 
 def extract_text_from_pdf(path):
-    """Витягує текст зі збереженням блочної структури (для таблиць)"""
     text = ""
     try:
         with fitz.open(path) as doc:
             for page in doc:
-                # "blocks" краще зберігає структуру колонок та таблиць
-                blocks = page.get_text("blocks")
-                for b in blocks:
-                    text += b[4] + "\n"
-                text += "\n" + "-"*20 + "\n"
+                text += page.get_text("blocks_text") if hasattr(page, 'get_text') else page.get_text()
+                text += "\n\n"
     except Exception as e:
         print(f"PDF Error: {e}")
     return text
 
 def extract_text_from_img(path):
-    """OCR для скріншотів"""
     try:
         img = Image.open(path)
-        # Збільшуємо чіткість для таблиць
-        text = pytesseract.image_to_string(img, lang='ukr+eng', config='--psm 6') 
+        # Режим psm 6 оптимізований для блоків тексту та таблиць
+        text = pytesseract.image_to_string(img, lang='ukr+eng', config='--psm 6')
         return text
     except:
         return ""
 
-# --- 4. ОБРОБКА ЧЕРЕЗ AI (ФОРМАТУВАННЯ) ---
-# --- ОНОВЛЕНА ФУНКЦІЯ ФОРМАТУВАННЯ ---
-def format_content(raw_text, user_caption):
-    # Якщо в підписі до фото є назва міни, використаємо її як заголовок
-    title = user_caption if user_caption else "ОБ'ЄКТ (БЕЗ НАЗВИ)"
+# --- 4. ЛОГІКА ОЦИФРУВАННЯ (КЛЮЧ-ЗНАЧЕННЯ) ---
+
+def format_to_military_struct(raw_text, user_caption):
+    # Використовуємо підпис користувача як назву об'єкта
+    title = user_caption.strip() if user_caption else "ОБ'ЄКТ (БЕЗ НАЗВИ)"
     
     try:
         res = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": """Ти — військовий технічний секретар. 
-                Твоє завдання: оцифрувати текст зі скріншотів технічної документації.
+                Твоє завдання: оцифрувати текст зі скріншотів або документів.
                 
                 СТРУКТУРА ВИВОДУ:
-                1. НА ПОЧАТКУ: Великий заголовок (назва міни).
+                1. НА ПОЧАТКУ: Назва об'єкта (великим шрифтом).
                 2. РОЗПОДІЛ ЗА БЛОКАМИ:
                    ### ЗАГАЛЬНІ ВІДОМОСТІ
                    ### ТЕХНІКО-ТАКТИЧНІ ХАРАКТЕРИСТИКИ (ТТХ)
-                   ### ДОДАТКОВІ ВІДОМОСТІ / ОСОБЛИВОСТІ
+                   ### ДОДАТКОВІ ВІДОМОСТІ
                 
                 ПРАВИЛА ОФОРМЛЕННЯ:
                 - ЗАБОРОНЕНО малювати таблиці символами | або -.
                 - ЗАМІСТЬ ТАБЛИЦЬ використовуй формат: **Назва параметра** — Значення (кожне з нового рядка).
-                - Якщо текст стосується мін, групуй характеристики (вага, тип підривника, радіус ураження тощо) у блок ТТХ.
-                - Текст має бути чистим, без твоїх коментарів."""},
-                {"role": "user", "content": f"НАЗВА: {title}\n\nТЕКСТ ЗІ СКРІНШОТІВ:\n{raw_text[:15000]}"}
+                - Якщо дані стосуються мін, ТТХ мають включати: вагу, тип підривника, датчики, радіус, час самоліквідації тощо.
+                - Текст має бути структурованим для легкого зчитування іншим ШІ. Без вступних слів."""},
+                {"role": "user", "content": f"НАЗВА: {title}\n\nСИРИЙ ТЕКСТ:\n{raw_text[:12000]}"}
             ],
             temperature=0.1
         )
         return res.choices[0].message.content
     except Exception as e:
-        return f"Помилка обробки: {e}"
+        return f"Помилка ШІ: {e}"
 
-# --- 5. ОБРОБНИКИ ---
+# --- 5. ОБРОБНИКИ ПОВІДОМЛЕНЬ ---
 
 @bot.message_handler(content_types=['photo', 'document'])
 def handle_files(message):
-    status = bot.reply_to(message, "📥 Зчитую дані та формую документ...")
+    status = bot.reply_to(message, "⚙️ Опрацьовую дані...")
     temp_path = f"input_{message.chat.id}"
-    res_path = f"result_{message.chat.id}.docx"
+    res_path = f"struct_{message.chat.id}.docx"
     
     try:
-        # Завантаження файлу або фото
         if message.content_type == 'photo':
             file_info = bot.get_file(message.photo[-1].file_id)
             temp_path += ".png"
@@ -111,37 +111,53 @@ def handle_files(message):
             if fname.endswith('.pdf'):
                 raw_text = extract_text_from_pdf(temp_path)
             elif fname.endswith('.docx'):
-                doc = docx.Document(temp_path)
-                raw_text = "\n".join([p.text for p in doc.paragraphs])
+                d = docx.Document(temp_path)
+                raw_text = "\n".join([p.text for p in d.paragraphs])
             else:
-                bot.reply_to(message, "❌ Формат не підтримується.")
+                bot.reply_to(message, "❌ Формат не підтримується (тільки PDF, DOCX або Фото).")
                 return
 
-        # Форматування через AI
-        formatted_text = format_content(raw_text)
+        # Оцифрування
+        caption = message.caption if message.caption else ""
+        formatted_data = format_to_military_struct(raw_text, caption)
 
-        # Створення вихідного DOCX файлу
-        output_doc = docx.Document()
-        output_doc.add_paragraph(formatted_text)
-        output_doc.save(res_path)
+        # Створення DOCX
+        doc_out = docx.Document()
+        for line in formatted_data.split('\n'):
+            if line.startswith('###'):
+                doc_out.add_heading(line.replace('###', '').strip(), level=3)
+            else:
+                doc_out.add_paragraph(line)
+        doc_out.save(res_path)
 
-        # Відправка результату
+        # Відправка
         with open(res_path, "rb") as f:
-            bot.send_document(message.chat.id, f, caption="✅ Текст оцифровано та збережено у файл.")
+            bot.send_document(message.chat.id, f, caption="✅ Дані структуровані у форматі Ключ-Значення.")
 
     except Exception as e:
-        bot.reply_to(message, f"⚠️ Помилка: {e}")
+        bot.reply_to(message, f"❌ Помилка: {e}")
     finally:
-        # Очищення
         for p in [temp_path, res_path]:
             if os.path.exists(p): os.remove(p)
         bot.delete_message(message.chat.id, status.message_id)
         gc.collect()
 
-# --- 6. ЗАПУСК ---
+# --- 6. ЗАПУСК (ВІДПОВІДНО ДО ВИМОГ RENDER) ---
+
 if __name__ == "__main__":
-    threading.Thread(target=run_web, daemon=True).start()
-    bot.remove_webhook()
-    time.sleep(1)
-    print("Бот готовий до зчитування!")
-    bot.infinity_polling()
+    # Спочатку запускаємо Flask у фоновому потоці
+    t = threading.Thread(target=run_web)
+    t.daemon = True
+    t.start()
+    
+    # Видаляємо вебхуки для уникнення помилки 409
+    try:
+        bot.remove_webhook()
+        time.sleep(1)
+    except:
+        pass
+    
+    print("Сервіс запущено. Очікування повідомлень...")
+    
+    # Запуск бота
+    bot.infinity_polling(timeout=90, long_polling_timeout=5)
