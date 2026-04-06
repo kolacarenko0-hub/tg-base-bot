@@ -1,128 +1,129 @@
 import os
+import time
+import threading
+import gc
 import telebot
 import fitz
 import docx
-import gc
 from openai import OpenAI
 from flask import Flask
 from PIL import Image
 import pytesseract
-import time
-import threading
 
-# --- СЕРВЕР ДЛЯ RENDER ---
+# --- 1. СЕРВЕР ---
 web_app = Flask(__name__)
 @web_app.route('/')
-def health_check(): return "Analyst Bot is Alive", 200
+def health_check(): return "Scanner Bot Active", 200
 
-# --- НАЛАШТУВАННЯ ---
+def run_web():
+    port = int(os.environ.get("PORT", 10000))
+    web_app.run(host="0.0.0.0", port=port)
+
+# --- 2. КОНФІГУРАЦІЯ ---
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 AI_KEY = os.environ.get("OPENAI_API_KEY")
 bot = telebot.TeleBot(TOKEN)
 client = OpenAI(api_key=AI_KEY)
 
-# --- ФУНКЦІЇ ЗЧИТУВАННЯ ---
+# --- 3. ФУНКЦІЇ ЗЧИТУВАННЯ ---
 
-def get_pdf_text(path):
+def extract_text_from_pdf(path):
+    """Витягує текст зі збереженням блочної структури (для таблиць)"""
     text = ""
     try:
         with fitz.open(path) as doc:
-            # Читаємо максимум перші 15 сторінок, щоб не "покласти" RAM
-            for i in range(min(len(doc), 15)):
-                text += doc[i].get_text()
+            for page in doc:
+                # "blocks" краще зберігає структуру колонок та таблиць
+                blocks = page.get_text("blocks")
+                for b in blocks:
+                    text += b[4] + "\n"
+                text += "\n" + "-"*20 + "\n"
     except Exception as e:
         print(f"PDF Error: {e}")
     return text
 
-def get_docx_text(path):
+def extract_text_from_img(path):
+    """OCR для скріншотів"""
     try:
-        doc = docx.Document(path)
-        return "\n".join([p.text for p in doc.paragraphs])
+        img = Image.open(path)
+        # Збільшуємо чіткість для таблиць
+        text = pytesseract.image_to_string(img, lang='ukr+eng', config='--psm 6') 
+        return text
     except:
         return ""
 
-def get_image_text(path):
-    try:
-        # Відкриваємо і відразу оптимізуємо розмір
-        img = Image.open(path)
-        img.thumbnail((1500, 1500)) 
-        return pytesseract.image_to_string(img, lang='ukr+eng')
-    except Exception as e:
-        return f"OCR Error: {e}"
-
-def analyze_text(content, query):
-    if not content.strip():
-        return "❌ Не вдалося витягнути текст із файлу. Переконайтеся, що це не 'картинка в PDF' (тоді краще зробіть скріншот)."
-    
+# --- 4. ОБРОБКА ЧЕРЕЗ AI (ФОРМАТУВАННЯ) ---
+def format_content(raw_text):
     try:
         res = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": "Ти військовий аналітик. Коротко і чітко дай відповідь за текстом."},
-                {"role": "user", "content": f"Запит: {query}\n\nТекст:\n{content[:7000]}"}
-            ]
+                {"role": "system", "content": "Ти — інструмент для оцифрування документів. Твоє завдання: переписати наданий текст ОДИН В ОДИН. Якщо в тексті є таблиці — відобрази їх у форматі Markdown таблиць. Не додавай від себе жодних коментарів, висновків чи привітань. Тільки чистий текст із документа."},
+                {"role": "user", "content": raw_text[:12000]}
+            ],
+            temperature=0
         )
         return res.choices[0].message.content
     except Exception as e:
-        return f"Помилка OpenAI: {e}"
+        return f"Помилка форматування: {e}"
 
-# --- ОБРОБНИКИ ТЕЛЕГРАМ ---
+# --- 5. ОБРОБНИКИ ---
 
-@bot.message_handler(content_types=['photo'])
-def handle_photo(message):
-    status = bot.reply_to(message, "🔍 Обробляю скріншот...")
-    path = f"img_{message.chat.id}.png"
-    try:
-        file_info = bot.get_file(message.photo[-1].file_id)
-        with open(path, "wb") as f:
-            f.write(bot.download_file(file_info.file_path))
-        
-        text = get_image_text(path)
-        ans = analyze_text(text, message.caption or "Проаналізуй")
-        bot.reply_to(message, ans)
-    finally:
-        if os.path.exists(path): os.remove(path)
-        bot.delete_message(message.chat.id, status.message_id)
-        gc.collect()
-
-@bot.message_handler(content_types=['document'])
-def handle_doc(message):
-    fname = message.document.file_name.lower()
-    status = bot.reply_to(message, "📄 Читаю документ...")
-    path = f"doc_{message.chat.id}_{fname}"
+@bot.message_handler(content_types=['photo', 'document'])
+def handle_files(message):
+    status = bot.reply_to(message, "📥 Зчитую дані та формую документ...")
+    temp_path = f"input_{message.chat.id}"
+    res_path = f"result_{message.chat.id}.docx"
     
     try:
-        file_info = bot.get_file(message.document.file_id)
-        with open(path, "wb") as f:
-            f.write(bot.download_file(file_info.file_path))
-        
-        text = ""
-        if fname.endswith('.pdf'):
-            text = get_pdf_text(path)
-        elif fname.endswith('.docx'):
-            text = get_docx_text(path)
-        
-        ans = analyze_text(text, message.caption or "Зроби витяг")
-        bot.reply_to(message, ans)
+        # Завантаження файлу або фото
+        if message.content_type == 'photo':
+            file_info = bot.get_file(message.photo[-1].file_id)
+            temp_path += ".png"
+            with open(temp_path, "wb") as f:
+                f.write(bot.download_file(file_info.file_path))
+            raw_text = extract_text_from_img(temp_path)
+        else:
+            fname = message.document.file_name.lower()
+            temp_path += f"_{fname}"
+            file_info = bot.get_file(message.document.file_id)
+            with open(temp_path, "wb") as f:
+                f.write(bot.download_file(file_info.file_path))
+            
+            if fname.endswith('.pdf'):
+                raw_text = extract_text_from_pdf(temp_path)
+            elif fname.endswith('.docx'):
+                doc = docx.Document(temp_path)
+                raw_text = "\n".join([p.text for p in doc.paragraphs])
+            else:
+                bot.reply_to(message, "❌ Формат не підтримується.")
+                return
+
+        # Форматування через AI
+        formatted_text = format_content(raw_text)
+
+        # Створення вихідного DOCX файлу
+        output_doc = docx.Document()
+        output_doc.add_paragraph(formatted_text)
+        output_doc.save(res_path)
+
+        # Відправка результату
+        with open(res_path, "rb") as f:
+            bot.send_document(message.chat.id, f, caption="✅ Текст оцифровано та збережено у файл.")
+
+    except Exception as e:
+        bot.reply_to(message, f"⚠️ Помилка: {e}")
     finally:
-        if os.path.exists(path): os.remove(path)
+        # Очищення
+        for p in [temp_path, res_path]:
+            if os.path.exists(p): os.remove(p)
         bot.delete_message(message.chat.id, status.message_id)
         gc.collect()
 
-# --- ЗАПУСК ---
-def run_flask():
-    port = int(os.environ.get("PORT", 10000))
-    web_app.run(host="0.0.0.0", port=port)
-
+# --- 6. ЗАПУСК ---
 if __name__ == "__main__":
-    # Запускаємо Flask у окремому потоці для Render
-    threading.Thread(target=run_flask, daemon=True).start()
-    
-    # Видаляємо старий веб-хук, щоб прибрати помилку 409
+    threading.Thread(target=run_web, daemon=True).start()
     bot.remove_webhook()
-    time.sleep(1) # Невелика пауза для стабілізації
-    
-    print("Бот запущений успішно через Long Polling...")
-    
-    # Запускаємо нескінченне опитування
-    bot.infinity_polling(timeout=90, long_polling_timeout=5)
+    time.sleep(1)
+    print("Бот готовий до зчитування!")
+    bot.infinity_polling()
