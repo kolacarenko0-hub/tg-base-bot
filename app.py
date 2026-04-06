@@ -5,15 +5,16 @@ import re
 import gc
 import telebot
 import fitz  # PyMuPDF
+import docx
 from openai import OpenAI
 from flask import Flask
 from PIL import Image
 import pytesseract
 
-# --- 1. ВЕБ-СЕРВЕР ДЛЯ ПІДТРИМКИ ЖИТТЄДІЯЛЬНОСТІ НА RENDER ---
+# --- 1. СЕРВЕР ---
 web_app = Flask(__name__)
 @web_app.route('/')
-def health_check(): return "Smart Queue OCR Active", 200
+def health_check(): return "Hybrid Analyst Active", 200
 
 def run_web():
     port = int(os.environ.get("PORT", 10000))
@@ -22,140 +23,123 @@ def run_web():
 # --- 2. КОНФІГУРАЦІЯ ---
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 AI_KEY = os.environ.get("OPENAI_API_KEY")
-
 bot = telebot.TeleBot(TOKEN)
 client = OpenAI(api_key=AI_KEY)
 
-# Налаштування лімітів для безкоштовного Render (512MB RAM)
-CHUNK_SIZE = 7  # Обробити по 7 сторінок за один підхід
+# --- 3. ФУНКЦІЇ ЗЧИТУВАННЯ ---
 
-# --- 3. ОПТИМІЗОВАНЕ ЗЧИТУВАННЯ СТОРІНКИ ---
-def get_text_ultra_light(page_index, file_path):
-    """Ізольоване відкриття однієї сторінки для економії RAM"""
+def extract_from_pdf(file_path):
+    """Просте текстове зчитування PDF (без OCR)"""
     text = ""
-    try:
-        doc = fitz.open(file_path)
-        page = doc[page_index]
-        text = page.get_text().strip()
-        
-        # Якщо тексту немає або це скан - вмикаємо економний OCR (чорно-білий)
-        if len(text) < 25:
-            # Масштаб 1.2 та сіра палітра споживають мінімум пам'яті
-            pix = page.get_pixmap(matrix=fitz.Matrix(1.2, 1.2), colorspace=fitz.csGRAY)
-            img = Image.frombytes("L", [pix.width, pix.height], pix.samples)
-            text = pytesseract.image_to_string(img, lang='ukr+eng')
-            del pix
-            del img
-        
-        doc.close()
-    except Exception as e:
-        print(f"Помилка на сторінці {page_index}: {e}")
-    
-    gc.collect() # Примусовий збір сміття
+    with fitz.open(file_path) as doc:
+        for page in doc:
+            text += page.get_text()
     return text
 
-# --- 4. РОЗУМНА ОБРОБКА ДІАПАЗОНУ (ЧЕРГА) ---
-def process_smart_chunks(chat_id, status_id, file_path, query, start_idx, end_idx):
-    output_filename = f"analysis_{chat_id}.txt"
-    current_status_id = status_id
+def extract_from_docx(file_path):
+    """Зчитування тексту з файлів Word"""
+    doc = docx.Document(file_path)
+    return "\n".join([para.text for para in doc.paragraphs])
 
-    with open(output_filename, "w", encoding="utf-8") as f:
-        f.write(f"📋 ЗВІТ АНАЛІТИКА (ЧЕРГОВА ОБРОБКА)\nЗапит: {query}\nДіапазон: {start_idx+1}-{end_idx}\n" + "="*35 + "\n")
+def extract_from_image(file_path):
+    """Зчитування тексту з фото/скріншота через OCR"""
+    img = Image.open(file_path)
+    # Оптимізація для ч/б для кращого розпізнавання
+    text = pytesseract.image_to_string(img, lang='ukr+eng')
+    return text
 
-    # Розбиваємо великий запит на безпечні частини (Chunks)
-    for chunk_start in range(start_idx, end_idx, CHUNK_SIZE):
-        chunk_end = min(chunk_start + CHUNK_SIZE, end_idx)
+# --- 4. АНАЛІЗ ЧЕРЕЗ AI ---
+def ask_ai(content, user_query):
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "Ти військовий аналітик. Опрацюй наданий текст згідно з запитом користувача. Відповідай чітко, структуруй головне."},
+                {"role": "user", "content": f"Запит: {user_query}\n\nТекст для аналізу:\n{content[:8000]}"}
+            ],
+            temperature=0.2
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        return f"Помилка AI: {e}"
+
+# --- 5. ОБРОБНИКИ ТЕЛЕГРАМ ---
+
+# Обробка фото (скріншоти)
+@bot.message_handler(content_types=['photo'])
+def handle_photo(message):
+    status = bot.reply_to(message, "📸 Бачу скріншот. Розпізнаю текст...")
+    try:
+        file_info = bot.get_file(message.photo[-1].file_id)
+        downloaded_file = bot.download_file(file_info.file_path)
+        temp_img = f"img_{message.chat.id}.png"
         
-        try:
-            bot.edit_message_text(
-                f"⏳ Обробка пакета сторінок: {chunk_start+1}-{chunk_end} з {end_idx}...", 
-                chat_id, current_status_id
-            )
-        except: pass
-
-        # Обробка сторінок всередині пакета
-        for i in range(chunk_start, chunk_end):
-            content = get_text_ultra_light(i, file_path)
+        with open(temp_img, 'wb') as f:
+            f.write(downloaded_file)
+        
+        text = extract_from_image(temp_img)
+        query = message.caption if message.caption else "Зроби загальний аналіз"
+        
+        if text.strip():
+            result = ask_ai(text, query)
+            bot.reply_to(message, result)
+        else:
+            bot.reply_to(message, "❌ Не вдалося розпізнати текст на зображенні.")
             
-            if content.strip():
-                try:
-                    res = client.chat.completions.create(
-                        model="gpt-4o-mini",
-                        messages=[
-                            {"role": "system", "content": "Ти військовий аналітик. Коротко випиши головні тези та цифри за запитом."},
-                            {"role": "user", "content": f"Запит: {query}\n\nТекст сторінки:\n{content[:3500]}"}
-                        ],
-                        temperature=0.1
-                    )
-                    with open(output_filename, "a", encoding="utf-8") as f:
-                        f.write(f"\n[Стор. {i+1}]\n{res.choices[0].message.content}\n")
-                except Exception as ai_e:
-                    print(f"AI Error: {ai_e}")
-
-            # Короткий "відпочинок" для RAM після кожної сторінки
-            gc.collect()
-            time.sleep(0.5)
-
-        # Пауза між пакетами сторінок (chunks)
-        time.sleep(2) 
+        os.remove(temp_img)
+    except Exception as e:
+        bot.reply_to(message, f"Помилка: {e}")
+    finally:
+        bot.delete_message(message.chat.id, status.message_id)
         gc.collect()
 
-    return output_filename, current_status_id
-
-# --- 5. ОБРОБНИКИ ПОВІДОМЛЕНЬ ---
+# Обробка документів (PDF, DOCX)
 @bot.message_handler(content_types=['document'])
-def handle_pdf(message):
-    if not message.document.file_name.lower().endswith('.pdf'):
-        bot.reply_to(message, "❌ Потрібен файл у форматі PDF.")
-        return
-
-    status = bot.reply_to(message, "📥 Файл отримано. Розраховую чергу обробки...")
-    temp_path = f"doc_{message.chat.id}.pdf"
+def handle_docs(message):
+    file_name = message.document.file_name.lower()
+    status = bot.reply_to(message, "📄 Опрацьовую документ...")
+    temp_path = f"file_{message.chat.id}_{file_name}"
     
     try:
-        # Завантаження
         file_info = bot.get_file(message.document.file_id)
-        with open(temp_path, "wb") as f:
-            f.write(bot.download_file(file_info.file_path))
-
-        # Визначаємо межі
-        doc = fitz.open(temp_path)
-        total_p = len(doc)
-        doc.close()
-
-        caption = message.caption if message.caption else ""
-        match = re.search(r'(\d+)\s*-\s*(\d+)', caption)
+        downloaded_file = bot.download_file(file_info.file_path)
         
-        if match:
-            start_idx = max(0, int(match.group(1)) - 1)
-            end_idx = min(total_p, int(match.group(2)))
+        with open(temp_path, 'wb') as f:
+            f.write(downloaded_file)
+        
+        text = ""
+        if file_name.endswith('.pdf'):
+            text = extract_from_pdf(temp_path)
+        elif file_name.endswith('.docx'):
+            text = extract_from_docx(temp_path)
         else:
-            start_idx, end_idx = 0, min(total_p, 5)
-            bot.send_message(message.chat.id, "⚠️ Діапазон не вказано. Роблю перші 5 сторінок. Для більшого пиши '1-20'.")
+            bot.reply_to(message, "❌ Формат не підтримується. Тільки PDF, DOCX або Фото.")
+            return
 
-        query = re.sub(r'\d+\s*-\s*\d+', '', caption).strip()
-        if not query: query = "Загальний аналіз змісту"
-
-        # Запуск черги
-        final_file, last_status_id = process_smart_chunks(message.chat.id, status.message_id, temp_path, query, start_idx, end_idx)
-
-        # Надсилання результату
-        with open(final_file, "rb") as f:
-            bot.send_document(message.chat.id, f, caption=f"✅ Обробка сторінок {start_idx+1}-{end_idx} завершена успішно.")
-
-        # Очищення файлів
-        for p in [temp_path, final_file]:
-            if os.path.exists(p): os.remove(p)
-        
-        try: bot.delete_message(message.chat.id, last_status_id)
-        except: pass
+        if text.strip():
+            query = message.caption if message.caption else "Зроби витяг головного"
+            result = ask_ai(text, query)
+            
+            # Якщо відповідь довга, відправляємо як файл або частинами
+            if len(result) > 4000:
+                with open("result.txt", "w", encoding="utf-8") as f:
+                    f.write(result)
+                with open("result.txt", "rb") as f:
+                    bot.send_document(message.chat.id, f)
+            else:
+                bot.reply_to(message, result)
+        else:
+            bot.reply_to(message, "❌ В файлі не знайдено тексту (можливо це скан? Спробуй надіслати скріншотом).")
 
     except Exception as e:
-        bot.send_message(message.chat.id, f"⚠️ Помилка обробки: {e}\nСпробуйте менший діапазон сторінок.")
+        bot.reply_to(message, f"Помилка: {e}")
+    finally:
         if os.path.exists(temp_path): os.remove(temp_path)
+        bot.delete_message(message.chat.id, status.message_id)
+        gc.collect()
 
 # --- 6. ЗАПУСК ---
 if __name__ == "__main__":
     threading.Thread(target=run_web, daemon=True).start()
-    bot.infinity_polling(timeout=90, long_polling_timeout=60)
-            
+    bot.infinity_polling(timeout=90)
+        
