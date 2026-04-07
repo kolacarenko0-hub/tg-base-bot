@@ -1,8 +1,7 @@
 pyTelegramBotAPI
-pymupdf
+PyMuPDF
 python-docx
 openai
 flask
-pytesseract
 Pillow
-python-docx
+pytesseract
