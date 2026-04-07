@@ -13,7 +13,7 @@ import pytesseract
 # --- 1. ВЕБ-СЕРВЕР ДЛЯ RENDER ---
 web_app = Flask(__name__)
 @web_app.route('/')
-def health_check(): return "Multi-Scanner Processor Active", 200
+def health_check(): return "Scanner Pro Active", 200
 
 def run_web():
     port = int(os.environ.get("PORT", 10000))
@@ -25,8 +25,14 @@ AI_KEY = os.environ.get("OPENAI_API_KEY")
 bot = telebot.TeleBot(TOKEN)
 client = OpenAI(api_key=AI_KEY)
 
-# Глобальний буфер для збереження тексту з різних фото одного користувача
 user_data_buffer = {}
 buffer_lock = threading.Lock()
 
-# --- 3. ШВИДКЕ ЗЧИТУВАННЯ ТЕКСТУ (OCR
+# --- 3. ШВИДКЕ ЗЧИТУВАННЯ ТЕКСТУ (OCR) ---
+def fast_ocr(file_path):
+    try:
+        with Image.open(file_path) as img:
+            # Оптимізація розміру для слабкого CPU Render
+            img.thumbnail((1500, 1500))
+            img = img.convert('L
+                          
