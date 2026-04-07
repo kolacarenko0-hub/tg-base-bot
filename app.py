@@ -1,170 +1,104 @@
 import os
 import time
 import threading
-import gc
+import base64
 import telebot
-import fitz  # PyMuPDF
-import docx
 from openai import OpenAI
 from flask import Flask
-from PIL import Image
-import pytesseract
 
-# --- 1. ВЕБ-СЕРВЕР (Для запобігання Port Timeout на Render) ---
+# --- 1. СЕРВЕР ---
 web_app = Flask(__name__)
-
 @web_app.route('/')
-def health_check():
-    return "Military Scanner Active", 200
+def health_check(): return "Vision Scanner Active", 200
 
 def run_web():
     port = int(os.environ.get("PORT", 10000))
     web_app.run(host="0.0.0.0", port=port)
 
-# --- 2. КОНФІГУРАЦІЯ (Змінні оточення) ---
+# --- 2. КОНФІГУРАЦІЯ ---
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 AI_KEY = os.environ.get("OPENAI_API_KEY")
 bot = telebot.TeleBot(TOKEN)
 client = OpenAI(api_key=AI_KEY)
 
-# Буфер для збереження тексту (chat_id: {data})
-user_data_buffer = {}
-buffer_lock = threading.Lock()
+# Тимчасове сховище для альбомів
+user_sessions = {}
+sessions_lock = threading.Lock()
 
-# --- 3. ШВИДКИЙ OCR (Оптимізовано для Render) ---
-def fast_ocr(file_path):
+# --- 3. ФУНКЦІЯ АНАЛІЗУ ЗОБРАЖЕНЬ (GPT-4o-mini Vision) ---
+def analyze_images(chat_id):
+    with sessions_lock:
+        session = user_sessions.get(chat_id)
+        if not session: return
+        image_urls = session['urls']
+        caption = session['caption'] if session['caption'] else "Об'єкт без назви"
+
     try:
-        with Image.open(file_path) as img:
-            # Зменшуємо розмір для економії RAM (Render дає лише 512МБ)
-            img.thumbnail((1500, 1500))
-            img = img.convert('L') # Чорно-білий режим прискорює зчитування
-            text = pytesseract.image_to_string(img, lang='ukr+eng', config='--psm 6')
-            return text
-    except Exception as e:
-        print(f"Помилка OCR: {e}")
-        return ""
-
-# --- 4. ФОРМУВАННЯ ЗВІТУ ЧЕРЕЗ AI ---
-def finalize_and_send(chat_id):
-    with buffer_lock:
-        data = user_data_buffer.get(chat_id)
-        if not data or not data['text'].strip():
-            return
+        # Формуємо запит з кількома зображеннями
+        content = [
+            {
+                "type": "text", 
+                "text": f"Ти військовий технічний аналітик. Оцифруй дані з цих фото про: {caption}. "
+                        "Зроби чіткий звіт: ### НАЗВА, ### ЗАГАЛЬНЕ, ### ТТХ (формат Параметр — Значення), ### ДОДАТКОВО. "
+                        "Якщо на різних фото одна і та ж міна — об'єднай дані."
+            }
+        ]
         
-        raw_content = data['text']
-        title = data['caption'] if data['caption'] else "ОБ'ЄКТ БЕЗ НАЗВИ"
-    
-    res_path = f"report_{chat_id}.docx"
-    try:
-        # Запит до GPT-4o-mini для структурування
+        for url in image_urls:
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": url}
+            })
+
         response = client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": """Ти — військовий технічний секретар. 
-                Згрупуй текст з кількох скріншотів в один структурований звіт.
-                СТРУКТУРА:
-                ### НАЗВА ОБ'ЄКТА
-                ### ЗАГАЛЬНІ ВІДОМОСТІ
-                ### ТЕХНІКО-ТАКТИЧНІ ХАРАКТЕРИСТИКИ (ТТХ)
-                ### ДОДАТКОВІ ВІДОМОСТІ
-                ПРАВИЛА:
-                - ТАБЛИЦІ ЗАБОРОНЕНІ. Формат: **Параметр** — Значення.
-                - Виправляй помилки OCR. Пиши стисло та професійно."""},
-                {"role": "user", "content": f"НАЗВА: {title}\n\nТЕКСТ:\n{raw_content}"}
-            ],
-            temperature=0
+            messages=[{"role": "user", "content": content}],
+            max_tokens=2000
         )
-        
+
         final_text = response.choices[0].message.content
-        
-        # Створення документа
-        doc = docx.Document()
-        for line in final_text.split('\n'):
-            if line.startswith('###'):
-                doc.add_heading(line.replace('###', '').strip(), level=3)
-            else:
-                doc.add_paragraph(line)
-        
-        doc.save(res_path)
-        with open(res_path, "rb") as f:
-            bot.send_document(chat_id, f, caption=f"✅ Об'єкт оцифровано: {title}")
+        bot.send_message(chat_id, final_text, parse_mode="Markdown")
 
     except Exception as e:
-        bot.send_message(chat_id, f"❌ Помилка AI: {e}")
+        bot.send_message(chat_id, f"❌ Помилка аналізу: {e}")
     finally:
-        with buffer_lock:
-            user_data_buffer.pop(chat_id, None)
-        if os.path.exists(res_path): 
-            os.remove(res_path)
-        gc.collect()
+        with sessions_lock:
+            user_sessions.pop(chat_id, None)
 
-# --- 5. ОБРОБНИКИ ПОВІДОМЛЕНЬ ---
-def photo_worker(message):
-    chat_id = message.chat.id
-    try:
-        file_info = bot.get_file(message.photo[-1].file_id)
-        temp_file = f"img_{chat_id}_{time.time()}.png"
-        
-        downloaded = bot.download_file(file_info.file_path)
-        with open(temp_file, 'wb') as f:
-            f.write(downloaded)
-        
-        text = fast_ocr(temp_file)
-        
-        with buffer_lock:
-            if chat_id in user_data_buffer:
-                user_data_buffer[chat_id]['text'] += f"\n{text}"
-                if message.caption:
-                    user_data_buffer[chat_id]['caption'] = message.caption
-        
-        if os.path.exists(temp_file): 
-            os.remove(temp_file)
-    except Exception as e:
-        print(f"Worker Error: {e}")
+# --- 4. ОБРОБНИКИ ---
 
 @bot.message_handler(content_types=['photo'])
 def handle_photos(message):
     chat_id = message.chat.id
-    with buffer_lock:
-        if chat_id not in user_data_buffer:
-            user_data_buffer[chat_id] = {'text': '', 'caption': message.caption, 'timer': None}
-            bot.send_message(chat_id, "📥 Скріншоти отримано. Починаю зчитування...")
+    
+    # Отримуємо пряме посилання на фото з серверів Telegram
+    file_info = bot.get_file(message.photo[-1].file_id)
+    file_url = f"https://api.telegram.org/file/bot{TOKEN}/{file_info.file_path}"
 
-        if user_data_buffer[chat_id]['timer']:
-            user_data_buffer[chat_id]['timer'].cancel()
+    with sessions_lock:
+        if chat_id not in user_sessions:
+            user_sessions[chat_id] = {'urls': [], 'caption': message.caption, 'timer': None}
+            bot.send_chat_action(chat_id, 'typing')
         
-        # Запуск OCR у фоновому потоці
-        threading.Thread(target=photo_worker, args=(message,), daemon=True).start()
+        user_sessions[chat_id]['urls'].append(file_url)
         
-        # Чекаємо 10 секунд після останнього фото в альбомі
-        t = threading.Timer(10.0, finalize_and_send, args=[chat_id])
-        user_data_buffer[chat_id]['timer'] = t
+        # Скидаємо таймер (чекаємо 6 секунд доки долетять всі фото альбому)
+        if user_sessions[chat_id]['timer']:
+            user_sessions[chat_id]['timer'].cancel()
+        
+        t = threading.Timer(6.0, analyze_images, args=[chat_id])
+        user_sessions[chat_id]['timer'] = t
         t.start()
 
-# --- 6. СТАРТ З ЗАХИСТОМ ВІД КОНФЛІКТІВ ---
+# --- 5. ЗАПУСК ---
 if __name__ == "__main__":
-    # 1. Запуск веб-сервера
     threading.Thread(target=run_web, daemon=True).start()
     
-    # 2. Очищення старих сесій (Рішення для 409)
-    try:
-        print("Ініціалізація... Очищення старих сесій.")
-        bot.remove_webhook()
-        time.sleep(2)
-        # Ігноруємо все, що прийшло, поки бот був вимкнений
-        bot.get_updates(offset=-1, timeout=1) 
-        print("Чергу очищено. Пауза 15 секунд для стабілізації Render...")
-        time.sleep(15)
-    except Exception as e:
-        print(f"Помилка при старті: {e}")
+    # Очищення старих сесій для уникнення 409
+    bot.remove_webhook()
+    time.sleep(1)
+    bot.get_updates(offset=-1, timeout=1)
     
-    print("--- БОТ ЗАПУЩЕНИЙ І ГОТОВИЙ ---")
-    
-    # 3. Постійне опитування з авто-перезапуском
-    while True:
-        try:
-            bot.polling(none_stop=True, interval=3, timeout=60)
-        except Exception as e:
-            print(f"Помилка з'єднання: {e}. Перезапуск через 10 сек...")
-            time.sleep(10)
+    print("Бот на базі Vision AI запущений!")
+    bot.infinity_polling(timeout=90)
         
