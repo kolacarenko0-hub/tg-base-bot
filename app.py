@@ -101,4 +101,3 @@ if __name__ == "__main__":
     
     print("Бот на базі Vision AI запущений!")
     bot.infinity_polling(timeout=90)
-        
