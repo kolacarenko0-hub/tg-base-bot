@@ -10,10 +10,10 @@ from flask import Flask
 from docx import Document
 from PIL import Image
 
-# --- 1. ВЕБ-СЕРВЕР ДЛЯ RENDER ---
+# --- 1. ВЕБ-СЕРВЕР ---
 web_app = Flask(__name__)
 @web_app.route('/')
-def health_check(): return "Precision-Splitter-OCR Active", 200
+def health_check(): return "Ready", 200
 
 def run_web():
     port = int(os.environ.get("PORT", 10000))
@@ -22,13 +22,16 @@ def run_web():
 # --- 2. КОНФІГУРАЦІЯ ---
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 AI_KEY = os.environ.get("OPENAI_API_KEY")
+# Сюди все ж таки краще вписати свій ID, щоб бот знав, у який чат звітувати
+MY_ID = "ТВІЙ_ТЕЛЕГРАМ_ID" 
+
 bot = telebot.TeleBot(TOKEN)
 client = OpenAI(api_key=AI_KEY)
 
 user_sessions = {}
 sessions_lock = threading.Lock()
 
-# --- 3. ГОЛОВНА ЛОГІКА: РОЗРІЗАННЯ ТА СКЛЕЮВАННЯ ---
+# --- 3. ЛОГІКА (ФРАГМЕНТАЦІЯ + КОРЕКТУРА) ---
 def process_fragmented_data(chat_id):
     with sessions_lock:
         session = user_sessions.get(chat_id)
@@ -36,133 +39,87 @@ def process_fragmented_data(chat_id):
         image_data_list = session['images']
 
     try:
-        raw_accumulated_text = ""
-        
+        raw_text = ""
         for img_bytes in image_data_list:
             img = Image.open(io.BytesIO(img_bytes))
-            width, height = img.size
-            
-            # Налаштування: 3 частини, напуск 150 пікселів (overlap)
+            w, h = img.size
             overlap = 150
-            part_h = height // 3
+            ph = h // 3
+            coords = [(0, 0, w, ph + overlap), (0, ph, w, 2 * ph + overlap), (0, 2 * ph, w, h)]
             
-            coords = [
-                (0, 0, width, part_h + overlap),
-                (0, part_h, width, 2 * part_h + overlap),
-                (0, 2 * part_h, width, height)
-            ]
-            
-            for i, box in enumerate(coords):
+            for box in coords:
                 fragment = img.crop(box)
-                buffered = io.BytesIO()
-                fragment.save(buffered, format="JPEG")
-                img_b64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
+                buf = io.BytesIO()
+                fragment.save(buf, format="JPEG")
+                img_b64 = base64.b64encode(buf.getvalue()).decode('utf-8')
 
-                # ЕТАП 1: Дослівне зчитування фрагмента
                 try:
-                    response = client.chat.completions.create(
+                    res = client.chat.completions.create(
                         model="gpt-4o-mini",
-                        messages=[{
-                            "role": "user",
-                            "content": [
-                                {"type": "text", "text": "ПЕРЕПИШИ ВЕСЬ ТЕКСТ ДОСЛІВНО. Тільки OCR знаків. Нічого не аналізуй."},
-                                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}", "detail": "high"}}
-                            ]
-                        }],
-                        max_tokens=1500,
+                        messages=[{"role": "user", "content": [
+                            {"type": "text", "text": "ПЕРЕПИШИ ТЕКСТ ДОСЛІВНО. Тільки OCR."},
+                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}", "detail": "high"}}
+                        ]}],
                         temperature=0
                     )
-                    raw_accumulated_text += response.choices[0].message.content + "\n"
-                    
-                    # ПАУЗА 2 сек, щоб не отримати помилку 429 (Rate Limit)
-                    time.sleep(2)
+                    raw_text += res.choices[0].message.content + "\n"
+                    time.sleep(1.5)
+                except: time.sleep(5)
 
-                except Exception as e:
-                    if "rate_limit_exceeded" in str(e).lower():
-                        bot.send_message(chat_id, "⏳ Перевищено ліміт токенів. Чекаю 10 секунд...")
-                        time.sleep(10)
-                    else:
-                        print(f"Помилка фрагмента: {e}")
-
-        # ЕТАП 2: Фінальна збірка (Тільки видалення дублікатів та структура)
-        final_struct = client.chat.completions.create(
+        # Коректура
+        fix = client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[{
-                "role": "user",
-                "content": f"""Ось фрагменти тексту. Деякі рядки повторюються через накладання частин — ВИДАЛИ ДУБЛІКАТИ. 
-                Впорядкуй текст за групами ### і нічого не скорочуй. Тільки чистий текст із документа.
-
-                ГРУПИ ДЛЯ СТРУКТУРИ:
-                ### ПРИЗНАЧЕННЯ ТА ЗАГАЛЬНИЙ ОПИС
-                ### ТЕХНІЧНІ ПАРАМЕТРИ ТА ПОКАЗНИКИ
-                ### ДЕТАЛЬНИЙ ОПИС КОНСТРУКЦІЇ
-                ### ПОРЯДОК РОБОТИ ТА ОБСЛУГОВУВАННЯ
-                ### ВІЗУАЛЬНІ ДАНІ ТА ПРИМІТКИ
-
-                ТЕКСТ:
-                {raw_accumulated_text}"""
-            }]
+            messages=[{"role": "user", "content": f"Ти технічний редактор. Виправ помилки OCR, видали дублікати, збережи структуру ###. Не скорочуй:\n\n{raw_text}"}]
         )
-        
-        clean_text = final_struct.choices[0].message.content
+        final_text = fix.choices[0].message.content
 
-        # ЕТАП 3: Створення файлу Word
+        # Word
         doc = Document()
-        doc.add_heading("Оцифрований документ", 0)
-        
-        for line in clean_text.split('\n'):
+        for line in final_text.split('\n'):
             line = line.strip()
             if not line: continue
-            
             if line.startswith('###'):
                 doc.add_heading(line.replace('###', '').strip(), level=1)
-            elif ":" in line and len(line.split(":")[0]) < 65:
-                p = doc.add_paragraph(style='List Bullet')
-                parts = line.split(":", 1)
-                p.add_run(parts[0].strip() + ": ").bold = True
-                p.add_run(parts[1].strip())
             else:
                 doc.add_paragraph(line)
 
-        file_path = f"report_{chat_id}.docx"
-        doc.save(file_path)
-        
-        with open(file_path, "rb") as f:
-            bot.send_document(chat_id, f, caption="✅ Оцифровка завершена. Обсяг збережено, дублікати видалено.")
-        
-        if os.path.exists(file_path): os.remove(file_path)
+        path = f"doc_{chat_id}.docx"
+        doc.save(path)
+        with open(path, "rb") as f:
+            bot.send_document(chat_id, f, caption="✅ Готово")
+        os.remove(path)
 
     except Exception as e:
-        bot.send_message(chat_id, f"❌ Критична помилка: {e}")
+        bot.send_message(chat_id, f"❌ Помилка: {e}")
     finally:
-        with sessions_lock:
-            user_sessions.pop(chat_id, None)
+        with sessions_lock: user_sessions.pop(chat_id, None)
 
-# --- 4. ОБРОБНИКИ ТЕЛЕГРАМ ---
+# --- 4. ОБРОБНИКИ ---
 @bot.message_handler(content_types=['photo'])
 def handle_photos(message):
-    chat_id = message.chat.id
-    file_info = bot.get_file(message.photo[-1].file_id)
-    downloaded_file = bot.download_file(file_info.file_path)
+    cid = message.chat.id
+    info = bot.get_file(message.photo[-1].file_id)
+    img = bot.download_file(info.file_path)
 
     with sessions_lock:
-        if chat_id not in user_sessions:
-            user_sessions[chat_id] = {'images': [], 'timer': None}
-            bot.send_message(chat_id, "⚙️ Запущено фрагментарне зчитування (обхід лімітів та фільтрів)...")
-        
-        user_sessions[chat_id]['images'].append(downloaded_file)
-        
-        if user_sessions[chat_id]['timer']:
-            user_sessions[chat_id]['timer'].cancel()
-        
-        # Таймер 12 секунд для збору альбому
-        t = threading.Timer(12.0, process_fragmented_data, args=[chat_id])
-        user_sessions[chat_id]['timer'] = t
+        if cid not in user_sessions:
+            user_sessions[cid] = {'images': [], 'timer': None}
+            bot.send_message(cid, "⚙️ Обробка...")
+        user_sessions[cid]['images'].append(img)
+        if user_sessions[cid]['timer']: user_sessions[cid]['timer'].cancel()
+        t = threading.Timer(12.0, process_fragmented_data, args=[cid])
+        user_sessions[cid]['timer'] = t
         t.start()
 
+# --- 5. СТАРТ ---
 if __name__ == "__main__":
     threading.Thread(target=run_web, daemon=True).start()
     bot.remove_webhook()
-    time.sleep(1)
-    print("Бот запущений (Precision Mode + RateLimit Protection)")
+    
+    # Повідомлення в чат бота
+    if MY_ID and MY_ID != "ТВІЙ_ТЕЛЕГРАМ_ID":
+        try:
+            bot.send_message(MY_ID, "🚀 Бот онлайн")
+        except: pass
+
     bot.infinity_polling(timeout=90)
