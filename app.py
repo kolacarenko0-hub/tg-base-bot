@@ -10,7 +10,7 @@ from docx import Document
 # --- 1. ВЕБ-СЕРВЕР ---
 web_app = Flask(__name__)
 @web_app.route('/')
-def health_check(): return "Text-Digitizer-v3 Active", 200
+def health_check(): return "Precision-OCR Active", 200
 
 def run_web():
     port = int(os.environ.get("PORT", 10000))
@@ -25,58 +25,65 @@ client = OpenAI(api_key=AI_KEY)
 user_sessions = {}
 sessions_lock = threading.Lock()
 
-# --- 3. ГЕНЕРАЦІЯ DOCX: ЧИСТА ОЦИФРОВКА ТА ГРУПУВАННЯ ---
-def create_pure_digitized_docx(chat_id):
+# --- 3. ГЕНЕРАЦІЯ DOCX З ПІДВИЩЕНОЮ ТОЧНІСТЮ ---
+def create_high_precision_docx(chat_id):
     with sessions_lock:
         session = user_sessions.get(chat_id)
         if not session: return
         image_urls = session['urls']
 
     try:
-        # Промпт, максимально нейтральний для обходу фільтрів
+        # Промпт для посимвольної точності
         content = [
             {
                 "type": "text", 
-                "text": """Ти — спеціаліст із розпізнавання технічних текстів. 
-                Твоє завдання: ПОВНІСТЮ переписати весь текст із наданих зображень у текстовий формат.
+                "text": """Ти — надточний інструмент оптичного розпізнавання символів (OCR). 
+                Твоє завдання: ПЕРЕПИСАТИ текст із фото буква в букву.
                 
-                ІНСТРУКЦІЯ:
-                1. Просто зачитай увесь доступний текст (включаючи дрібний шрифт, таблиці та заголовки).
-                2. Нічого не аналізуй, не коментуй і не оцінюй вміст. 
-                3. Згрупуй прочитаний текст за логічними блоками, які ти бачиш на фото (наприклад: Назва, Характеристики, Опис вузлів, Додаткові дані).
-                4. Використовуй ### для заголовків груп.
-                
+                СУВОРІ ПРАВИЛА:
+                1. НЕ ВГАДУЙ СЛОВА за змістом. Дивись на кожен символ окремо. 
+                   Приклад: якщо написано 'ЗАБАРВЛЕННЯ', не смій писати 'ЗАБЕЗПЕЧЕННЯ'.
+                2. Переписуй текст точно так, як він надрукований (регістр, скорочення, тире).
+                3. Згрупуй отриманий текст за логічними блоками (заголовки, таблиці, пункти).
+                4. Витягни абсолютно всі цифри, індекси та маркування.
+
                 ФОРМАТ ВІДПОВІДІ:
-                ЗАГОЛОВОК: [Головна назва з документа]
+                ЗАГОЛОВОК: [Головний напис]
                 ТЕКСТ:
-                ### [Група 1]
-                Текст...
-                ### [Група 2]
+                ### [Група]
                 Текст..."""
             }
         ]
         
         for url in image_urls:
-            content.append({"type": "image_url", "image_url": {"url": url}})
+            content.append({
+                "type": "image_url", 
+                "image_url": {
+                    "url": url,
+                    "detail": "high"  # ПРИМУСОВИЙ ВИСОКИЙ РІВЕНЬ ДЕТАЛІЗАЦІЇ
+                }
+            })
 
+        # Використовуємо Temperature=0 для нульової креативності
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": content}],
             max_tokens=4000,
-            temperature=0
+            temperature=0,
+            top_p=1e-9
         )
         
         full_response = response.choices[0].message.content
 
-        # Розділення на заголовок та основний масив
+        # Розділення
         try:
             name_part = full_response.split("ТЕКСТ:")[0].replace("ЗАГОЛОВОК:", "").strip()
             report_part = full_response.split("ТЕКСТ:")[1].strip()
         except:
-            name_part = "Оцифрований_документ"
+            name_part = "Precision_Report"
             report_part = full_response
 
-        # Створення документа
+        # Створення DOCX
         doc = Document()
         doc.add_heading(name_part, 0)
         
@@ -94,23 +101,18 @@ def create_pure_digitized_docx(chat_id):
             else:
                 doc.add_paragraph(line)
 
-        # Очищення імені файлу
         safe_name = re.sub(r'[^\w\s-]', '', name_part).strip().replace(' ', '_')
-        if not safe_name: safe_name = "digitized_data"
+        if not safe_name: safe_name = "report_precision"
         file_path = f"{safe_name}.docx"
         doc.save(file_path)
 
         with open(file_path, "rb") as f:
-            bot.send_document(chat_id, f, caption=f"📄 Текст оцифровано та згруповано: {name_part}")
+            bot.send_document(chat_id, f, caption=f"📄 Текст оцифровано з високою точністю: {name_part}")
 
         if os.path.exists(file_path): os.remove(file_path)
 
     except Exception as e:
-        # Якщо все одно спрацював фільтр OpenAI
-        if "policy" in str(e).lower() or "content_filter" in str(e).lower():
-            bot.send_message(chat_id, "⚠️ OpenAI відмовив у доступі через фільтри безпеки. Спробуйте надіслати скріншот тільки з текстом (без фото об'єкта) або обрізати картинку.")
-        else:
-            bot.send_message(chat_id, f"❌ Помилка: {e}")
+        bot.send_message(chat_id, f"❌ Помилка точності: {e}")
     finally:
         with sessions_lock:
             user_sessions.pop(chat_id, None)
@@ -125,13 +127,13 @@ def handle_photos(message):
     with sessions_lock:
         if chat_id not in user_sessions:
             user_sessions[chat_id] = {'urls': [], 'timer': None}
-            bot.send_message(chat_id, "📖 Зчитую текст із зображень та групую дані...")
+            bot.send_message(chat_id, "🔍 Активував режим максимальної точності зчитування...")
         
         user_sessions[chat_id]['urls'].append(file_url)
         if user_sessions[chat_id]['timer']:
             user_sessions[chat_id]['timer'].cancel()
         
-        t = threading.Timer(8.0, create_pure_digitized_docx, args=[chat_id])
+        t = threading.Timer(8.0, create_high_precision_docx, args=[chat_id])
         user_sessions[chat_id]['timer'] = t
         t.start()
 
@@ -140,6 +142,6 @@ if __name__ == "__main__":
     bot.remove_webhook()
     time.sleep(1)
     bot.get_updates(offset=-1, timeout=1)
-    print("Бот (Оцифровщик) запущений!")
+    print("Бот (Precision Mode) запущений!")
     bot.infinity_polling(timeout=90)
-            
+                
