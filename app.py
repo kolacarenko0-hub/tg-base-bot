@@ -7,16 +7,16 @@ from openai import OpenAI
 from flask import Flask
 from docx import Document
 
-# --- 1. ВЕБ-СЕРВЕР ДЛЯ RENDER (HEALTH CHECK) ---
+# --- 1. ВЕБ-СЕРВЕР ---
 web_app = Flask(__name__)
 @web_app.route('/')
-def health_check(): return "Military Data Digitizer v4.0 Active", 200
+def health_check(): return "Full-Data-Extractor Active", 200
 
 def run_web():
     port = int(os.environ.get("PORT", 10000))
     web_app.run(host="0.0.0.0", port=port)
 
-# --- 2. КОНФІГУРАЦІЯ ТА КЛЮЧІ ---
+# --- 2. КОНФІГУРАЦІЯ ---
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 AI_KEY = os.environ.get("OPENAI_API_KEY")
 bot = telebot.TeleBot(TOKEN)
@@ -25,37 +25,39 @@ client = OpenAI(api_key=AI_KEY)
 user_sessions = {}
 sessions_lock = threading.Lock()
 
-# --- 3. ГОЛОВНА ФУНКЦІЯ: ОЦИФРОВКА ТА УНІФІКАЦІЯ ---
-def create_unified_docx(chat_id):
+# --- 3. ГЕНЕРАЦІЯ DOCX: МАКСИМАЛЬНА ЕКСТРАКЦІЯ ---
+def create_full_data_docx(chat_id):
     with sessions_lock:
         session = user_sessions.get(chat_id)
         if not session: return
         image_urls = session['urls']
 
     try:
-        # Промпт для технічної уніфікації заголовків
+        # Промпт, що вимагає 100% перенесення тексту
         content = [
             {
                 "type": "text", 
-                "text": """Ти — технічний архітектор баз даних. Твоє завдання: оцифрувати текст із фото та згрупувати його за СТАНДАРТНИМИ ТЕХНІЧНИМИ ЗАГОЛОВКАМИ для подальшої обробки ШІ.
+                "text": """Ти — технічний копіїст. Твоє завдання: ПОВНІСТЮ ТА ДОСЛІВНО перенести весь текст із зображень у документ. 
+                Нічого не скорочуй! Якщо в оригіналі 10 речень — у тебе має бути 10 речень.
                 
-                ПРАВИЛА ГРУПУВАННЯ (використовуй ці назви для заголовків ###):
-                1. ### ПРИЗНАЧЕННЯ ТА ЗАГАЛЬНИЙ ОПИС — призначення, принцип дії, загальні відомості.
-                2. ### ТЕХНІЧНІ ХАРАКТЕРИСТИКИ (ТТХ) — цифри, таблиці, вага, габарити.
-                3. ### БУДОВА ТА КОМПЛЕКТАЦІЯ — підривники, детонатори, вузли, внутрішні частини.
-                4. ### ОСОБЛИВОСТІ ЗАСТОСУВАННЯ — встановлення, засоби механізації, способи мінування.
-                5. ### МАРКУВАННЯ ТА ЗАБАРВЛЕННЯ — колір, шифри на корпусі, зовнішні ознаки.
+                ІНСТРУКЦІЇ:
+                1. Знайди та витягни КОЖНЕ слово, кожну цифру, кожну виноску та примітку.
+                2. Текст має бути МАКСИМАЛЬНО ОБ'ЄМНИМ. Якщо бачиш опис — копіюй його повністю.
+                3. Особлива увага на специфічні назви (детонатори, підривники, індекси) — не смій їх пропускати.
+                4. Обов'язково описуй те, що бачиш на малюнках та схемах текстом.
                 
-                СУВОРІ ВИМОГИ ДО ТОЧНОСТІ:
-                - Переписуй текст БУКВА В БУКВУ (напр. ЗАБАРВЛЕННЯ, а не ЗАБЕЗПЕЧЕННЯ).
-                - Якщо якогось розділу на фото немає — не створюй його.
-                - Не додавай від себе жодних коментарів.
-                
+                РОЗПОДІЛИ ВЕСЬ ВИТЯГНУТИЙ ТЕКСТ ЗА ЦИМИ ЗАГОЛОВКАМИ (###):
+                - ПРИЗНАЧЕННЯ ТА ПРИНЦИП ДІЇ (Весь вступний та описовий текст).
+                - ТЕХНІЧНІ ХАРАКТЕРИСТИКИ (ТТХ) (Всі дані з таблиць та цифри).
+                - ДЕТАЛЬНИЙ ОПИС БУДОВИ (Вузи, підривники, матеріали).
+                - ПОРЯДОК ЗАСТОСУВАННЯ ТА МЕХАНІЗАЦІЯ (Методи встановлення).
+                - ВІЗУАЛЬНІ ОЗНАКИ, МАРКУВАННЯ ТА БЕЗПЕКА (Колір, написи).
+
                 ФОРМАТ ВІДПОВІДІ:
-                НАЗВА: [Марка об'єкта, напр. ТМ-57]
+                НАЗВА: [Марка об'єкта]
                 ТЕКСТ:
                 ### [Стандартний заголовок]
-                Текст..."""
+                (Сюди пиши весь об'єм тексту без скорочень)"""
             }
         ]
         
@@ -65,26 +67,24 @@ def create_unified_docx(chat_id):
                 "image_url": {"url": url, "detail": "high"}
             })
 
-        # Параметри для максимальної точності
+        # Трохи підняли температуру (0.1), щоб він краще зв'язував довгі тексти
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": content}],
             max_tokens=4000,
-            temperature=0,
-            top_p=1e-9
+            temperature=0.1
         )
         
         full_response = response.choices[0].message.content
 
-        # Розбір відповіді
         try:
             name_part = full_response.split("ТЕКСТ:")[0].replace("НАЗВА:", "").strip()
             report_part = full_response.split("ТЕКСТ:")[1].strip()
         except:
-            name_part = "Технічний_документ"
+            name_part = "Повний_технічний_звіт"
             report_part = full_response
 
-        # Формування документа
+        # Створення документа
         doc = Document()
         doc.add_heading(name_part, 0)
         
@@ -93,10 +93,8 @@ def create_unified_docx(chat_id):
             if not line: continue
             
             if line.startswith('###'):
-                # Стандартизований заголовок для зручного зчитування основним ботом
                 doc.add_heading(line.replace('###', '').strip(), level=1)
-            elif ":" in line and len(line.split(":")[0]) < 60:
-                # Оформлення характеристик
+            elif ":" in line and len(line.split(":")[0]) < 70:
                 p = doc.add_paragraph(style='List Bullet')
                 parts = line.split(":", 1)
                 p.add_run(parts[0].strip() + ": ").bold = True
@@ -104,24 +102,23 @@ def create_unified_docx(chat_id):
             else:
                 doc.add_paragraph(line)
 
-        # Очищення та збереження
         safe_name = re.sub(r'[^\w\s-]', '', name_part).strip().replace(' ', '_')
-        if not safe_name: safe_name = "unified_report"
+        if not safe_name: safe_name = "full_data_report"
         file_path = f"{safe_name}.docx"
         doc.save(file_path)
 
         with open(file_path, "rb") as f:
-            bot.send_document(chat_id, f, caption=f"✅ Дані уніфіковано: {name_part}")
+            bot.send_document(chat_id, f, caption=f"📄 Дані оцифровано в повному обсязі: {name_part}")
 
         if os.path.exists(file_path): os.remove(file_path)
 
     except Exception as e:
-        bot.send_message(chat_id, f"❌ Помилка обробки: {e}")
+        bot.send_message(chat_id, f"❌ Помилка екстракції: {e}")
     finally:
         with sessions_lock:
             user_sessions.pop(chat_id, None)
 
-# --- 4. ОБРОБНИКИ ТЕЛЕГРАМ ---
+# --- 4. ОБРОБНИКИ ---
 @bot.message_handler(content_types=['photo'])
 def handle_photos(message):
     chat_id = message.chat.id
@@ -131,26 +128,20 @@ def handle_photos(message):
     with sessions_lock:
         if chat_id not in user_sessions:
             user_sessions[chat_id] = {'urls': [], 'timer': None}
-            bot.send_message(chat_id, "⚙️ Виконую точне зчитування та уніфікацію розділів...")
+            bot.send_message(chat_id, "🚀 Запущено повну екстракцію даних без скорочень...")
         
         user_sessions[chat_id]['urls'].append(file_url)
-        
         if user_sessions[chat_id]['timer']:
             user_sessions[chat_id]['timer'].cancel()
         
-        # Таймер 8 секунд для збору альбому
-        t = threading.Timer(8.0, create_unified_docx, args=[chat_id])
+        # Збільшили час до 10 сек, щоб точно зібрати альбом
+        t = threading.Timer(10.0, create_full_data_docx, args=[chat_id])
         user_sessions[chat_id]['timer'] = t
         t.start()
 
-# --- 5. ЗАПУСК ДОДАТКУ ---
 if __name__ == "__main__":
-    # Запуск Flask у фоновому потоці
     threading.Thread(target=run_web, daemon=True).start()
-    
-    # Запуск Bot Polling
     bot.remove_webhook()
     time.sleep(1)
-    print("Бот запущений та готовий до створення бази знань!")
-    bot.infinity_polling(timeout=90)
-                
+    print("Бот (Повна Екстракція) запущений!")
+    bot.
