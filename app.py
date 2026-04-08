@@ -10,7 +10,7 @@ from docx import Document
 # --- 1. ВЕБ-СЕРВЕР ---
 web_app = Flask(__name__)
 @web_app.route('/')
-def health_check(): return "Focus-Mode Active", 200
+def health_check(): return "Total Digitizer Active", 200
 
 def run_web():
     port = int(os.environ.get("PORT", 10000))
@@ -25,44 +25,32 @@ client = OpenAI(api_key=AI_KEY)
 user_sessions = {}
 sessions_lock = threading.Lock()
 
-# --- 3. ГЕНЕРАЦІЯ DOCX З ФОКУСОМ НА КЛЮЧОВИХ ДЕТАЛЯХ ---
-def create_focused_docx(chat_id):
+# --- 3. ГЕНЕРАЦІЯ DOCX: ПОВНЕ ГРУПУВАННЯ ТЕКСТУ ---
+def create_total_docx(chat_id):
     with sessions_lock:
         session = user_sessions.get(chat_id)
         if not session: return
         image_urls = session['urls']
 
     try:
-        # Промпт, що орієнтується на візуальні акценти (CAPS, таблиці, виділення)
+        # Промпт для повної оцифровки без втрат
         content = [
             {
                 "type": "text", 
-                "text": """Ти — технічний експерт. Твоє завдання: оцифрувати документ із фото, зберігаючи МАКСИМАЛЬНУ деталізацію.
-
-                Особливу увагу звертай на:
-                1. Текст, написаний ВЕЛИКИМИ ЛІТЕРАМИ (CAPS LOCK) — це назви вузлів, засобів чи режимів.
-                2. Дані в таблицях та списках.
-                3. Індекси, маркування та специфічні абревіатури.
-                4. Усі цифрові показники.
-
-                ФОРМАТ ВІДПОВІДІ:
-                НАЗВА: [Точна назва об'єкта, знайдена на фото]
-                ЗВІТ:
-                ### [ПОВНА НАЗВА ТА ІНДЕКС]
+                "text": """Ти — професійний стенографіст та технічний аналітик. 
+                Твоє завдання: ПОВНІСТЮ перенести весь текст із зображень у документ.
                 
-                ### ОСНОВНІ ХАРАКТЕРИСТИКИ
-                (Випиши всі цифри та параметри)
-
-                ### ДЕТАЛІЗАЦІЯ КОМПОНЕНТІВ ТА ЗАСОБІВ
-                (Тут опиши всі специфічні назви, пристрої, типи механізмів та додаткові елементи, які виділені в тексті як ключові)
-
-                ### ТЕХНІЧНІ ОСОБЛИВОСТІ ТА ПРИМІТКИ
-                (Опиши нюанси конструкції, маркування, режими роботи та іншу важливу інформацію, що була на зображенні)
-
-                ПРАВИЛА:
-                - Не узагальнюй. Якщо в тексті вказано конкретну модель компонента — записуй її повністю.
-                - Текст має бути розбитий на дрібні, легкочитні пункти.
-                - Використовуй професійну термінологію з оригіналу."""
+                ІНСТРУКЦІЯ:
+                1. Витягни абсолютно всі написи, включаючи дрібний шрифт, примітки та дані в таблицях.
+                2. Згрупуй цей текст за логічними розділами. 
+                3. Якщо назва розділу написана капсом або жирним — збережи це виділення.
+                4. Не пропускай жодної абревіатури, індексу чи цифрового показника.
+                
+                СТРУКТУРА ВІДПОВІДІ:
+                НАЗВА: [Точна назва об'єкта з фото]
+                ЗВІТ:
+                [Тут має бути весь структурований текст, розбитий на логічні блоки за допомогою заголовків ###]
+                """
             }
         ]
         
@@ -78,15 +66,15 @@ def create_focused_docx(chat_id):
         
         full_response = response.choices[0].message.content
 
-        # Логіка розподілу
+        # Розділення назви та тексту
         try:
             name_part = full_response.split("ЗВІТ:")[0].replace("НАЗВА:", "").strip()
             report_part = full_response.split("ЗВІТ:")[1].strip()
         except:
-            name_part = "Технічний_звіт"
+            name_part = "Повний_текстовий_звіт"
             report_part = full_response
 
-        # Створення документа
+        # Створення DOCX
         doc = Document()
         doc.add_heading(name_part, 0)
         
@@ -95,30 +83,31 @@ def create_focused_docx(chat_id):
             if not line: continue
             
             if line.startswith('###'):
+                # Створюємо новий розділ
                 doc.add_heading(line.replace('###', '').strip(), level=1)
+            elif ":" in line and len(line.split(":")[0]) < 60:
+                # Форматуємо пари "Ключ: Значення"
+                p = doc.add_paragraph(style='List Bullet')
+                parts = line.split(":", 1)
+                p.add_run(parts[0].strip() + ": ").bold = True
+                p.add_run(parts[1].strip())
             else:
-                # Якщо рядок містить ключову пару "Параметр: Значення"
-                if ":" in line and len(line.split(":")[0]) < 50:
-                    p = doc.add_paragraph(style='List Bullet')
-                    parts = line.split(":", 1)
-                    p.add_run(parts[0].strip() + ": ").bold = True
-                    p.add_run(parts[1].strip())
-                else:
-                    doc.add_paragraph(line)
+                # Звичайний текст
+                doc.add_paragraph(line)
 
-        # Файл
+        # Збереження файлу
         safe_name = re.sub(r'[^\w\s-]', '', name_part).strip().replace(' ', '_')
-        if not safe_name: safe_name = "report"
+        if not safe_name: safe_name = "full_report"
         file_path = f"{safe_name}.docx"
         doc.save(file_path)
 
         with open(file_path, "rb") as f:
-            bot.send_document(chat_id, f, caption=f"✅ Звіт сформовано: {name_part}")
+            bot.send_document(chat_id, f, caption=f"📄 Повна оцифровка тексту виконана: {name_part}")
 
         if os.path.exists(file_path): os.remove(file_path)
 
     except Exception as e:
-        bot.send_message(chat_id, f"❌ Помилка аналізу: {e}")
+        bot.send_message(chat_id, f"❌ Помилка оцифровки: {e}")
     finally:
         with sessions_lock:
             user_sessions.pop(chat_id, None)
@@ -133,13 +122,14 @@ def handle_photos(message):
     with sessions_lock:
         if chat_id not in user_sessions:
             user_sessions[chat_id] = {'urls': [], 'timer': None}
-            bot.send_message(chat_id, "⚙️ Опрацьовую візуальні дані та виділяю ключові моменти...")
+            bot.send_message(chat_id, "📑 Починаю повне зчитування та групування тексту...")
         
         user_sessions[chat_id]['urls'].append(file_url)
         if user_sessions[chat_id]['timer']:
             user_sessions[chat_id]['timer'].cancel()
         
-        t = threading.Timer(8.0, create_focused_docx, args=[chat_id])
+        # 8 секунд на збір усіх фото в один звіт
+        t = threading.Timer(8.0, create_total_docx, args=[chat_id])
         user_sessions[chat_id]['timer'] = t
         t.start()
 
@@ -148,5 +138,6 @@ if __name__ == "__main__":
     bot.remove_webhook()
     time.sleep(1)
     bot.get_updates(offset=-1, timeout=1)
-    print("Бот запущений (Режим фокусу на CAPS)")
+    print("Бот (Повна оцифровка) запущений!")
     bot.infinity_polling(timeout=90)
+            
