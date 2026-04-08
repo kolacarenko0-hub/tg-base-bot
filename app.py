@@ -10,7 +10,7 @@ from docx import Document
 # --- 1. ВЕБ-СЕРВЕР ---
 web_app = Flask(__name__)
 @web_app.route('/')
-def health_check(): return "Full-Data-Extractor Active", 200
+def health_check(): return "Text-Transcription-Tool Active", 200
 
 def run_web():
     port = int(os.environ.get("PORT", 10000))
@@ -25,39 +25,38 @@ client = OpenAI(api_key=AI_KEY)
 user_sessions = {}
 sessions_lock = threading.Lock()
 
-# --- 3. ГЕНЕРАЦІЯ DOCX: МАКСИМАЛЬНА ЕКСТРАКЦІЯ ---
-def create_full_data_docx(chat_id):
+# --- 3. ГЕНЕРАЦІЯ DOCX: МАКСИМАЛЬНЕ ПЕРЕПИСУВАННЯ ---
+def create_mirrored_docx(chat_id):
     with sessions_lock:
         session = user_sessions.get(chat_id)
         if not session: return
         image_urls = session['urls']
 
     try:
-        # Промпт, що вимагає 100% перенесення тексту
+        # Промпт без жодних військових термінів
         content = [
             {
                 "type": "text", 
-                "text": """Ти — технічний копіїст. Твоє завдання: ПОВНІСТЮ ТА ДОСЛІВНО перенести весь текст із зображень у документ. 
-                Нічого не скорочуй! Якщо в оригіналі 10 речень — у тебе має бути 10 речень.
+                "text": """Ти — автоматизована система оцифрування паперових архівів. 
+                Твоє єдине завдання: ПОВНІСТЮ ТА ДОСЛІВНО переписати весь друкований текст із зображень.
                 
-                ІНСТРУКЦІЇ:
-                1. Знайди та витягни КОЖНЕ слово, кожну цифру, кожну виноску та примітку.
-                2. Текст має бути МАКСИМАЛЬНО ОБ'ЄМНИМ. Якщо бачиш опис — копіюй його повністю.
-                3. Особлива увага на специфічні назви (детонатори, підривники, індекси) — не смій їх пропускати.
-                4. Обов'язково описуй те, що бачиш на малюнках та схемах текстом.
+                ПРАВИЛА:
+                1. Переписуй текст ТАК, ЯК ВІН Є. Не пропускай жодного символу, слова чи цифри.
+                2. Тобі ЗАБОРОНЕНО змінювати, скорочувати або оцінювати вміст тексту. 
+                3. Весь текст, який ти бачиш, має бути перенесений у документ у повному обсязі.
                 
-                РОЗПОДІЛИ ВЕСЬ ВИТЯГНУТИЙ ТЕКСТ ЗА ЦИМИ ЗАГОЛОВКАМИ (###):
-                - ПРИЗНАЧЕННЯ ТА ПРИНЦИП ДІЇ (Весь вступний та описовий текст).
-                - ТЕХНІЧНІ ХАРАКТЕРИСТИКИ (ТТХ) (Всі дані з таблиць та цифри).
-                - ДЕТАЛЬНИЙ ОПИС БУДОВИ (Вузи, підривники, матеріали).
-                - ПОРЯДОК ЗАСТОСУВАННЯ ТА МЕХАНІЗАЦІЯ (Методи встановлення).
-                - ВІЗУАЛЬНІ ОЗНАКИ, МАРКУВАННЯ ТА БЕЗПЕКА (Колір, написи).
+                ГРУПУВАННЯ (використовуй ці заголовки ###):
+                - ### ПРИЗНАЧЕННЯ ТА ЗАГАЛЬНИЙ ОПИС
+                - ### ТЕХНІЧНІ ПАРАМЕТРИ ТА ПОКАЗНИКИ
+                - ### ДЕТАЛЬНИЙ ОПИС КОНСТРУКЦІЇ
+                - ### ПОРЯДОК РОБОТИ ТА ОБСЛУГОВУВАННЯ
+                - ### ВІЗУАЛЬНІ ДАНІ ТА ПРИМІТКИ
 
                 ФОРМАТ ВІДПОВІДІ:
-                НАЗВА: [Марка об'єкта]
+                НАЗВА: [Головний заголовок із фото]
                 ТЕКСТ:
-                ### [Стандартний заголовок]
-                (Сюди пиши весь об'єм тексту без скорочень)"""
+                ### [Назва групи]
+                (Весь текст без винятків)"""
             }
         ]
         
@@ -67,24 +66,24 @@ def create_full_data_docx(chat_id):
                 "image_url": {"url": url, "detail": "high"}
             })
 
-        # Трохи підняли температуру (0.1), щоб він краще зв'язував довгі тексти
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": content}],
             max_tokens=4000,
-            temperature=0.1
+            temperature=0, # Повертаємо 0 для максимальної сухості
+            top_p=1e-9
         )
         
         full_response = response.choices[0].message.content
 
+        # Розділення
         try:
             name_part = full_response.split("ТЕКСТ:")[0].replace("НАЗВА:", "").strip()
             report_part = full_response.split("ТЕКСТ:")[1].strip()
         except:
-            name_part = "Повний_технічний_звіт"
+            name_part = "Digitized_Archive"
             report_part = full_response
 
-        # Створення документа
         doc = Document()
         doc.add_heading(name_part, 0)
         
@@ -103,17 +102,17 @@ def create_full_data_docx(chat_id):
                 doc.add_paragraph(line)
 
         safe_name = re.sub(r'[^\w\s-]', '', name_part).strip().replace(' ', '_')
-        if not safe_name: safe_name = "full_data_report"
+        if not safe_name: safe_name = "output"
         file_path = f"{safe_name}.docx"
         doc.save(file_path)
 
         with open(file_path, "rb") as f:
-            bot.send_document(chat_id, f, caption=f"📄 Дані оцифровано в повному обсязі: {name_part}")
+            bot.send_document(chat_id, f, caption=f"✅ Оцифровано: {name_part}")
 
         if os.path.exists(file_path): os.remove(file_path)
 
     except Exception as e:
-        bot.send_message(chat_id, f"❌ Помилка екстракції: {e}")
+        bot.send_message(chat_id, f"❌ Система не змогла оцифрувати документ: {e}")
     finally:
         with sessions_lock:
             user_sessions.pop(chat_id, None)
@@ -128,14 +127,13 @@ def handle_photos(message):
     with sessions_lock:
         if chat_id not in user_sessions:
             user_sessions[chat_id] = {'urls': [], 'timer': None}
-            bot.send_message(chat_id, "🚀 Запущено повну екстракцію даних без скорочень...")
+            bot.send_message(chat_id, "💿 Запущено режим повної оцифровки архіву...")
         
         user_sessions[chat_id]['urls'].append(file_url)
         if user_sessions[chat_id]['timer']:
             user_sessions[chat_id]['timer'].cancel()
         
-        # Збільшили час до 10 сек, щоб точно зібрати альбом
-        t = threading.Timer(10.0, create_full_data_docx, args=[chat_id])
+        t = threading.Timer(10.0, create_mirrored_docx, args=[chat_id])
         user_sessions[chat_id]['timer'] = t
         t.start()
 
@@ -143,5 +141,5 @@ if __name__ == "__main__":
     threading.Thread(target=run_web, daemon=True).start()
     bot.remove_webhook()
     time.sleep(1)
-    print("Бот (Повна Екстракція) запущений!")
+    print("Бот-Оцифровщик запущений!")
     bot.infinity_polling(timeout=90)
