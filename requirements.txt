@@ -2,3 +2,4 @@ pyTelegramBotAPI
 openai
 flask
 python-docx
+Pillow
